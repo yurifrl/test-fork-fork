@@ -2,7 +2,7 @@ name: Smart Fork Sync
 
 on:
   schedule:
-    - cron: '0 */6 * * *' # Every 6 hours
+    - cron: '0 */6 * * *'
   repository_dispatch:
     types: [upstream_changed]
   workflow_dispatch:
@@ -30,7 +30,6 @@ jobs:
         run: |
           UPSTREAM_REPO="${{ vars.UPSTREAM_REPO }}"
           if [ -z "$UPSTREAM_REPO" ]; then
-            # Auto-detect from GitHub fork API
             UPSTREAM_REPO=$(gh api repos/${{ github.repository }} --jq '.parent.full_name // empty')
             if [ -z "$UPSTREAM_REPO" ]; then
               echo "::error::No upstream repo found. Set UPSTREAM_REPO variable or ensure this is a GitHub fork."
@@ -46,15 +45,12 @@ jobs:
       - name: Check for upstream changes
         id: check
         run: |
-          UPSTREAM_HEAD=$(git rev-parse upstream/main)
-          # Check if upstream/main is already an ancestor of our main
           if git merge-base --is-ancestor upstream/main main 2>/dev/null; then
             echo "already_synced=true" >> $GITHUB_OUTPUT
             echo "✅ Fork is already up to date with upstream"
           else
             echo "already_synced=false" >> $GITHUB_OUTPUT
             echo "🔄 Upstream has new changes"
-            echo "Upstream HEAD: $UPSTREAM_HEAD"
             git log --oneline main..upstream/main
           fi
 
@@ -74,8 +70,7 @@ jobs:
 
       - name: Install Claude CLI
         if: steps.check.outputs.already_synced == 'false' && steps.rebase.outputs.conflict == 'true'
-        run: |
-          npm install -g @anthropic-ai/claude-code
+        run: npm install -g @anthropic-ai/claude-code
 
       - name: Claude resolve conflicts
         if: steps.check.outputs.already_synced == 'false' && steps.rebase.outputs.conflict == 'true'
@@ -86,37 +81,48 @@ jobs:
           git branch -D sync-upstream
           git checkout -b sync-upstream main
 
-          # Start rebase and let Claude resolve each conflict
+          # Start rebase
           git rebase upstream/main 2>&1 || true
 
+          MAX_ATTEMPTS=20
+          ATTEMPT=0
+
           while [ -d ".git/rebase-merge" ] || [ -d ".git/rebase-apply" ]; do
+            ATTEMPT=$((ATTEMPT + 1))
+            if [ "$ATTEMPT" -gt "$MAX_ATTEMPTS" ]; then
+              echo "::error::Too many rebase steps, aborting"
+              git rebase --abort
+              exit 1
+            fi
+
             CONFLICTED=$(git diff --name-only --diff-filter=U)
             if [ -z "$CONFLICTED" ]; then
-              git rebase --continue 2>&1 || true
+              GIT_EDITOR=true git rebase --continue 2>&1 || true
               continue
             fi
 
             echo "🤖 Asking Claude to resolve conflicts in: $CONFLICTED"
 
-            claude -p --max-turns 10 "You are resolving git rebase conflicts in a fork repository.
-          The fork has custom commits that must stay ON TOP of upstream changes.
-          The upstream changes should be accepted as the base, and fork customizations should be reapplied on top.
+            # Use claude with proper permissions and constrained tools
+            claude -p \
+              --permission-mode bypassPermissions \
+              --allowedTools "Edit,View,Bash(git add *),Bash(cat *)" \
+              --max-turns 5 \
+              "Resolve the git rebase conflicts in these files: $CONFLICTED
 
-          CONFLICT RESOLUTION RULES:
-          1. For files that exist ONLY in the fork: keep the fork version
-          2. For files that exist ONLY in upstream: accept the upstream version
-          3. For files modified by BOTH: merge intelligently - accept upstream as base, reapply fork customizations
-          4. If a fork change conflicts with upstream, prefer keeping BOTH changes integrated
-          5. After resolving, run: git add <resolved_files>
+          Rules:
+          - Read each conflicted file with View
+          - Remove ALL conflict markers (<<<<<<< HEAD, =======, >>>>>>> ...)
+          - Keep BOTH upstream and fork content merged intelligently
+          - Fork customizations take priority when they truly conflict
+          - After editing each file, run: git add <filename>
 
-          Conflicted files: $CONFLICTED
+          Do it now. No explanation needed."
 
-          Resolve all conflicts now. Use git add on each file after resolving."
-
-            # Check if Claude resolved it
+            # Verify resolution
             STILL_CONFLICTED=$(git diff --name-only --diff-filter=U)
             if [ -n "$STILL_CONFLICTED" ]; then
-              echo "::error::Claude could not resolve conflicts in: $STILL_CONFLICTED"
+              echo "::error::Claude could not resolve: $STILL_CONFLICTED"
               git rebase --abort
               exit 1
             fi
@@ -124,7 +130,7 @@ jobs:
             GIT_EDITOR=true git rebase --continue 2>&1 || true
           done
 
-          echo "✅ All conflicts resolved by Claude"
+          echo "✅ All conflicts resolved"
 
       - name: Create PR
         if: steps.check.outputs.already_synced == 'false'
@@ -133,32 +139,22 @@ jobs:
         run: |
           git push -f origin sync-upstream
 
-          # Check for existing PR
           EXISTING_PR=$(gh pr list --head sync-upstream --json number --jq '.[0].number // empty')
           if [ -n "$EXISTING_PR" ]; then
             echo "📝 Updated existing PR #$EXISTING_PR"
           else
-            UPSTREAM_COMMITS=$(git log --oneline sync-upstream..upstream/main 2>/dev/null | wc -l || echo "new")
             gh pr create \
               --title "🔄 Sync with upstream" \
               --body "## Smart Fork Sync
 
-          Automatically rebased fork commits on top of latest upstream changes.
+          Rebased fork commits on top of latest upstream changes from \`${{ env.UPSTREAM_REPO }}\`.
 
-          **Upstream:** \`${{ env.UPSTREAM_REPO }}\`
-
-          ### What happened
-          - Fetched latest upstream changes
-          - Rebased fork-specific commits on top
-          - Fork customizations remain as the topmost commits
-
-          ### Commits from upstream
+          ### Upstream commits
           \`\`\`
-          $(git log --oneline $(git merge-base main upstream/main)..upstream/main)
+          $(git log --oneline $(git merge-base origin/main upstream/main)..upstream/main)
           \`\`\`
 
-          ---
-          *Auto-generated by [smart-fork](https://github.com/yurifrl/test-fork-fork/actions) sync*" \
+          *Auto-generated by smart-fork sync*" \
               --head sync-upstream \
               --base main
           fi
