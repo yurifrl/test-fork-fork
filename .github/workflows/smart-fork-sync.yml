@@ -1,0 +1,164 @@
+name: Smart Fork Sync
+
+on:
+  schedule:
+    - cron: '0 */6 * * *' # Every 6 hours
+  repository_dispatch:
+    types: [upstream_changed]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream remote
+        run: |
+          UPSTREAM_REPO="${{ vars.UPSTREAM_REPO }}"
+          if [ -z "$UPSTREAM_REPO" ]; then
+            # Auto-detect from GitHub fork API
+            UPSTREAM_REPO=$(gh api repos/${{ github.repository }} --jq '.parent.full_name // empty')
+            if [ -z "$UPSTREAM_REPO" ]; then
+              echo "::error::No upstream repo found. Set UPSTREAM_REPO variable or ensure this is a GitHub fork."
+              exit 1
+            fi
+          fi
+          echo "UPSTREAM_REPO=$UPSTREAM_REPO" >> $GITHUB_ENV
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
+          git fetch upstream
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Check for upstream changes
+        id: check
+        run: |
+          UPSTREAM_HEAD=$(git rev-parse upstream/main)
+          # Check if upstream/main is already an ancestor of our main
+          if git merge-base --is-ancestor upstream/main main 2>/dev/null; then
+            echo "already_synced=true" >> $GITHUB_OUTPUT
+            echo "✅ Fork is already up to date with upstream"
+          else
+            echo "already_synced=false" >> $GITHUB_OUTPUT
+            echo "🔄 Upstream has new changes"
+            echo "Upstream HEAD: $UPSTREAM_HEAD"
+            git log --oneline main..upstream/main
+          fi
+
+      - name: Attempt rebase
+        if: steps.check.outputs.already_synced == 'false'
+        id: rebase
+        run: |
+          git checkout -b sync-upstream main
+          if git rebase upstream/main 2>&1; then
+            echo "conflict=false" >> $GITHUB_OUTPUT
+            echo "✅ Rebase succeeded cleanly"
+          else
+            git rebase --abort
+            echo "conflict=true" >> $GITHUB_OUTPUT
+            echo "⚠️ Rebase has conflicts, will use Claude to resolve"
+          fi
+
+      - name: Install Claude CLI
+        if: steps.check.outputs.already_synced == 'false' && steps.rebase.outputs.conflict == 'true'
+        run: |
+          npm install -g @anthropic-ai/claude-code
+
+      - name: Claude resolve conflicts
+        if: steps.check.outputs.already_synced == 'false' && steps.rebase.outputs.conflict == 'true'
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          git checkout main
+          git branch -D sync-upstream
+          git checkout -b sync-upstream main
+
+          # Start rebase and let Claude resolve each conflict
+          git rebase upstream/main 2>&1 || true
+
+          while [ -d ".git/rebase-merge" ] || [ -d ".git/rebase-apply" ]; do
+            CONFLICTED=$(git diff --name-only --diff-filter=U)
+            if [ -z "$CONFLICTED" ]; then
+              git rebase --continue 2>&1 || true
+              continue
+            fi
+
+            echo "🤖 Asking Claude to resolve conflicts in: $CONFLICTED"
+
+            claude -p --max-turns 10 "You are resolving git rebase conflicts in a fork repository.
+          The fork has custom commits that must stay ON TOP of upstream changes.
+          The upstream changes should be accepted as the base, and fork customizations should be reapplied on top.
+
+          CONFLICT RESOLUTION RULES:
+          1. For files that exist ONLY in the fork: keep the fork version
+          2. For files that exist ONLY in upstream: accept the upstream version
+          3. For files modified by BOTH: merge intelligently - accept upstream as base, reapply fork customizations
+          4. If a fork change conflicts with upstream, prefer keeping BOTH changes integrated
+          5. After resolving, run: git add <resolved_files>
+
+          Conflicted files: $CONFLICTED
+
+          Resolve all conflicts now. Use git add on each file after resolving."
+
+            # Check if Claude resolved it
+            STILL_CONFLICTED=$(git diff --name-only --diff-filter=U)
+            if [ -n "$STILL_CONFLICTED" ]; then
+              echo "::error::Claude could not resolve conflicts in: $STILL_CONFLICTED"
+              git rebase --abort
+              exit 1
+            fi
+
+            GIT_EDITOR=true git rebase --continue 2>&1 || true
+          done
+
+          echo "✅ All conflicts resolved by Claude"
+
+      - name: Create PR
+        if: steps.check.outputs.already_synced == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git push -f origin sync-upstream
+
+          # Check for existing PR
+          EXISTING_PR=$(gh pr list --head sync-upstream --json number --jq '.[0].number // empty')
+          if [ -n "$EXISTING_PR" ]; then
+            echo "📝 Updated existing PR #$EXISTING_PR"
+          else
+            UPSTREAM_COMMITS=$(git log --oneline sync-upstream..upstream/main 2>/dev/null | wc -l || echo "new")
+            gh pr create \
+              --title "🔄 Sync with upstream" \
+              --body "## Smart Fork Sync
+
+          Automatically rebased fork commits on top of latest upstream changes.
+
+          **Upstream:** \`${{ env.UPSTREAM_REPO }}\`
+
+          ### What happened
+          - Fetched latest upstream changes
+          - Rebased fork-specific commits on top
+          - Fork customizations remain as the topmost commits
+
+          ### Commits from upstream
+          \`\`\`
+          $(git log --oneline $(git merge-base main upstream/main)..upstream/main)
+          \`\`\`
+
+          ---
+          *Auto-generated by [smart-fork](https://github.com/yurifrl/test-fork-fork/actions) sync*" \
+              --head sync-upstream \
+              --base main
+          fi
