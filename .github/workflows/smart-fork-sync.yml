@@ -14,86 +14,74 @@ permissions:
 jobs:
   sync:
     runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - name: Checkout fork
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          token: ${{ secrets.GITHUB_TOKEN }}
+          token: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
 
       - name: Configure git
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-      - name: Add upstream remote
+      - name: Add upstream and check changes
+        id: check
         run: |
+          # Auto-detect upstream from GitHub fork API
           UPSTREAM_REPO="${{ vars.UPSTREAM_REPO }}"
           if [ -z "$UPSTREAM_REPO" ]; then
             UPSTREAM_REPO=$(gh api repos/${{ github.repository }} --jq '.parent.full_name // empty')
-            if [ -z "$UPSTREAM_REPO" ]; then
-              echo "::error::No upstream repo found. Set UPSTREAM_REPO variable or ensure this is a GitHub fork."
-              exit 1
-            fi
+          fi
+          if [ -z "$UPSTREAM_REPO" ]; then
+            echo "::error::Not a fork and UPSTREAM_REPO not set"
+            exit 1
           fi
           echo "UPSTREAM_REPO=$UPSTREAM_REPO" >> $GITHUB_ENV
           git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
           git fetch upstream
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Check for upstream changes
-        id: check
-        run: |
           if git merge-base --is-ancestor upstream/main main 2>/dev/null; then
-            echo "already_synced=true" >> $GITHUB_OUTPUT
-            echo "✅ Fork is already up to date with upstream"
+            echo "synced=true" >> $GITHUB_OUTPUT
+            echo "✅ Already up to date"
           else
-            echo "already_synced=false" >> $GITHUB_OUTPUT
-            echo "🔄 Upstream has new changes"
+            echo "synced=false" >> $GITHUB_OUTPUT
+            echo "🔄 New upstream changes:"
             git log --oneline main..upstream/main
           fi
 
-      - name: Attempt rebase
-        if: steps.check.outputs.already_synced == 'false'
+      - name: Rebase fork on upstream
+        if: steps.check.outputs.synced == 'false'
         id: rebase
         run: |
           git checkout -b sync-upstream main
+
           if git rebase upstream/main 2>&1; then
             echo "conflict=false" >> $GITHUB_OUTPUT
-            echo "✅ Rebase succeeded cleanly"
           else
             git rebase --abort
             echo "conflict=true" >> $GITHUB_OUTPUT
-            echo "⚠️ Rebase has conflicts, will use Claude to resolve"
           fi
 
-      - name: Install Claude CLI
-        if: steps.check.outputs.already_synced == 'false' && steps.rebase.outputs.conflict == 'true'
-        run: npm install -g @anthropic-ai/claude-code
-
       - name: Claude resolve conflicts
-        if: steps.check.outputs.already_synced == 'false' && steps.rebase.outputs.conflict == 'true'
+        if: steps.check.outputs.synced == 'false' && steps.rebase.outputs.conflict == 'true'
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
+          npm install -g @anthropic-ai/claude-code
+
           git checkout main
           git branch -D sync-upstream
           git checkout -b sync-upstream main
-
-          # Start rebase
           git rebase upstream/main 2>&1 || true
 
-          MAX_ATTEMPTS=20
-          ATTEMPT=0
-
+          MAX=20; I=0
           while [ -d ".git/rebase-merge" ] || [ -d ".git/rebase-apply" ]; do
-            ATTEMPT=$((ATTEMPT + 1))
-            if [ "$ATTEMPT" -gt "$MAX_ATTEMPTS" ]; then
-              echo "::error::Too many rebase steps, aborting"
-              git rebase --abort
-              exit 1
-            fi
+            I=$((I + 1))
+            [ "$I" -gt "$MAX" ] && { echo "::error::Too many rebase steps"; git rebase --abort; exit 1; }
 
             CONFLICTED=$(git diff --name-only --diff-filter=U)
             if [ -z "$CONFLICTED" ]; then
@@ -101,60 +89,49 @@ jobs:
               continue
             fi
 
-            echo "🤖 Asking Claude to resolve conflicts in: $CONFLICTED"
-
-            # Use claude with proper permissions and constrained tools
+            echo "🤖 Claude resolving: $CONFLICTED"
             claude -p \
               --permission-mode bypassPermissions \
               --allowedTools "Edit,View,Bash(git add *),Bash(cat *)" \
               --max-turns 5 \
-              "Resolve the git rebase conflicts in these files: $CONFLICTED
+              "Resolve git rebase conflicts in: $CONFLICTED
+            Read each file, remove ALL conflict markers, merge both sides intelligently (fork customizations win on true conflicts), then git add each file."
 
-          Rules:
-          - Read each conflicted file with View
-          - Remove ALL conflict markers (<<<<<<< HEAD, =======, >>>>>>> ...)
-          - Keep BOTH upstream and fork content merged intelligently
-          - Fork customizations take priority when they truly conflict
-          - After editing each file, run: git add <filename>
-
-          Do it now. No explanation needed."
-
-            # Verify resolution
-            STILL_CONFLICTED=$(git diff --name-only --diff-filter=U)
-            if [ -n "$STILL_CONFLICTED" ]; then
-              echo "::error::Claude could not resolve: $STILL_CONFLICTED"
+            STILL=$(git diff --name-only --diff-filter=U)
+            if [ -n "$STILL" ]; then
+              echo "::error::Unresolved: $STILL"
               git rebase --abort
               exit 1
             fi
-
             GIT_EDITOR=true git rebase --continue 2>&1 || true
           done
+          echo "✅ Conflicts resolved"
 
-          echo "✅ All conflicts resolved"
-
-      - name: Create PR
-        if: steps.check.outputs.already_synced == 'false'
+      - name: Push and create PR
+        if: steps.check.outputs.synced == 'false'
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
         run: |
           git push -f origin sync-upstream
 
-          EXISTING_PR=$(gh pr list --head sync-upstream --json number --jq '.[0].number // empty')
-          if [ -n "$EXISTING_PR" ]; then
-            echo "📝 Updated existing PR #$EXISTING_PR"
+          EXISTING=$(gh pr list --head sync-upstream --json number --jq '.[0].number // empty')
+          if [ -n "$EXISTING" ]; then
+            echo "📝 Updated existing PR #$EXISTING"
           else
-            gh pr create \
-              --title "🔄 Sync with upstream" \
-              --body "## Smart Fork Sync
+            # Build body safely
+            UPSTREAM_LOG=$(git log --oneline "$(git merge-base origin/main upstream/main)..upstream/main" 2>/dev/null || echo "unable to compute")
+            BODY=$(cat <<EOF
+          ## Smart Fork Sync
 
-          Rebased fork commits on top of latest upstream changes from \`${{ env.UPSTREAM_REPO }}\`.
+          Rebased fork commits on top of **${UPSTREAM_REPO}**.
 
           ### Upstream commits
           \`\`\`
-          $(git log --oneline $(git merge-base origin/main upstream/main)..upstream/main)
+          ${UPSTREAM_LOG}
           \`\`\`
 
-          *Auto-generated by smart-fork sync*" \
-              --head sync-upstream \
-              --base main
+          *Auto-generated by smart-fork sync*
+          EOF
+          )
+            gh pr create --title "🔄 Sync with upstream" --body "$BODY" --head sync-upstream --base main
           fi
